@@ -2,15 +2,20 @@ import SwiftUI
 import WebKit
 import Speech
 import AVFoundation
+import CryptoKit
 
 struct ContentView: View {
     @State private var isTranslating = false
     @State private var subtitleText = "等待视频播放..."
     
-    // 默认填入一个占位提示
-    @State private var urlString = "http://[你的IPv6地址]:8096"
+    // ⚠️ 填入你的 IPv6 地址
+    @State private var urlString = "http://[你的IPv6]:8096"
     @State private var currentURL: URL? = nil
     @FocusState private var isUrlFocused: Bool
+    
+    // ⚠️ 填入你的百度翻译 API
+    let baiduAppId = "你的APP_ID"
+    let baiduSecretKey = "你的密钥"
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -37,14 +42,10 @@ struct ContentView: View {
             // 浏览器与字幕层
             ZStack(alignment: .bottom) {
                 if let url = currentURL {
-                    // ⚠️ 注意：这里我们去掉了 JS 强行抓音频的逻辑！
-                    // 因为 IPv6 和 Jellyfin 的流媒体加密，JS 100% 抓不到，还会导致网页崩溃
-                    AudioCaptureWebView(url: url, isListening: isTranslating) { audioBuffer in
-                        self.recognitionRequest?.append(audioBuffer)
-                    }
-                    .edgesIgnoringSafeArea(.bottom)
+                    WebView(url: url)
+                        .edgesIgnoringSafeArea(.bottom)
                 } else {
-                    Text("请输入 Jellyfin 地址").foregroundColor(.gray)
+                    Text("请输入网址并点击前往").foregroundColor(.gray)
                 }
                 
                 // 底部悬浮字幕
@@ -91,21 +92,15 @@ struct ContentView: View {
     
     func loadURL() {
         var formattedUrl = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
-        
-        // 针对 IPv6 的特殊处理，千万别乱加 https，不然会报错
         if !formattedUrl.hasPrefix("http://") && !formattedUrl.hasPrefix("https://") {
             formattedUrl = "http://" + formattedUrl
         }
-        
         if let url = URL(string: formattedUrl) {
             currentURL = url
             isUrlFocused = false
-        } else {
-            subtitleText = "网址格式错误，请检查 IPv6 格式"
         }
     }
     
-    // MARK: - 麦克风听译逻辑（回到最稳的方案）
     func startTranslation() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
@@ -114,12 +109,10 @@ struct ContentView: View {
                         try self.setupMicrophone()
                         self.setupSpeechRecognition()
                         isTranslating = true
-                        subtitleText = "正在听麦克风声音（请外放视频）..."
+                        subtitleText = "正在听麦克风声音..."
                     } catch {
-                        subtitleText = "启动失败，请检查权限"
+                        subtitleText = "启动失败"
                     }
-                } else {
-                    subtitleText = "请去设置允许麦克风和语音识别权限"
                 }
             }
         }
@@ -127,7 +120,6 @@ struct ContentView: View {
     
     func setupMicrophone() throws {
         let audioSession = AVAudioSession.sharedInstance()
-        // 要求使用麦克风，并且允许混音（这样视频外放的声音也能被录进去）
         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
         try audioSession.setActive(true)
     }
@@ -138,15 +130,14 @@ struct ContentView: View {
         guard let request = recognitionRequest else { return }
         request.shouldReportPartialResults = true
         
-        // 开启麦克风硬件底层收音
-        let inputNode = AVAudioEngine().inputNode
+        let audioEngine = AVAudioEngine()
+        let inputNode = audioEngine.inputNode
         
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
-                DispatchQueue.main.async {
-                    self.subtitleText = japanese
-                }
+                // 调用百度翻译
+                self.translateWithBaidu(text: japanese)
             }
         }
         
@@ -155,10 +146,32 @@ struct ContentView: View {
             self.recognitionRequest?.append(buffer)
         }
         
-        let audioEngine = AVAudioEngine()
-        audioEngine.attach(inputNode)
         audioEngine.prepare()
         try? audioEngine.start()
+    }
+    
+    func translateWithBaidu(text: String) {
+        if text.isEmpty { return }
+        let salt = String(Int(Date().timeIntervalSince1970))
+        let signStr = baiduAppId + text + salt + baiduSecretKey
+        let sign = Insecure.MD5.hash(data: signStr.data(using: .utf8)!).map { String(format: "%02hhx", $0) }.joined()
+        
+        var request = URLRequest(url: URL(string: "https://fanyi-api.baidu.com/api/trans/vip/translate")!)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        let params = "q=\(text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&from=jp&to=zh&appid=\(baiduAppId)&salt=\(salt)&sign=\(sign)"
+        request.httpBody = params.data(using: .utf8)
+        
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data else { return }
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let transResult = json["trans_result"] as? [[String: Any]],
+               let dst = transResult.first?["dst"] as? String {
+                DispatchQueue.main.async {
+                    self.subtitleText = dst
+                }
+            }
+        }.resume()
     }
     
     func stopTranslation() {
@@ -169,27 +182,16 @@ struct ContentView: View {
     }
 }
 
-// 纯净版 WebView（去掉了那些会拦截网页的 JS）
-struct AudioCaptureWebView: UIViewRepresentable {
+struct WebView: UIViewRepresentable {
     let url: URL
-    let isListening: Bool
-    let onAudioBuffer: (AVAudioPCMBuffer) -> Void
-    
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
-        
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.load(URLRequest(url: url))
         return webView
     }
-    
-    func updateUIView(_ uiView: WKWebView, context: Context) {
-        if uiView.url?.absoluteString != url.absoluteString {
-            uiView.load(URLRequest(url: url))
-        }
-    }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
 @main
