@@ -7,9 +7,9 @@ struct ContentView: View {
     @State private var isTranslating = false
     @State private var subtitleText = "等待视频播放..."
     
-    // 浏览器状态
-    @State private var urlString = "https://www.w3schools.com/html/html5_video.asp"
-    @State private var currentURL: URL? = URL(string: "https://www.w3schools.com/html/html5_video.asp")
+    // 默认填入一个占位提示
+    @State private var urlString = "http://[你的IPv6地址]:8096"
+    @State private var currentURL: URL? = nil
     @FocusState private var isUrlFocused: Bool
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
@@ -18,7 +18,7 @@ struct ContentView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 1. 顶部地址栏
+            // 顶部地址栏
             HStack {
                 TextField("输入网址", text: $urlString)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
@@ -26,25 +26,25 @@ struct ContentView: View {
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                     .focused($isUrlFocused)
-                    .onSubmit {
-                        loadURL()
-                    }
+                    .onSubmit { loadURL() }
                 
-                Button("前往") {
-                    loadURL()
-                }
-                .padding(.leading, 5)
+                Button("前往") { loadURL() }
+                    .padding(.leading, 5)
             }
             .padding()
             .background(Color(UIColor.systemGray6))
             
-            // 2. 浏览器与字幕层
+            // 浏览器与字幕层
             ZStack(alignment: .bottom) {
                 if let url = currentURL {
+                    // ⚠️ 注意：这里我们去掉了 JS 强行抓音频的逻辑！
+                    // 因为 IPv6 和 Jellyfin 的流媒体加密，JS 100% 抓不到，还会导致网页崩溃
                     AudioCaptureWebView(url: url, isListening: isTranslating) { audioBuffer in
                         self.recognitionRequest?.append(audioBuffer)
                     }
                     .edgesIgnoringSafeArea(.bottom)
+                } else {
+                    Text("请输入 Jellyfin 地址").foregroundColor(.gray)
                 }
                 
                 // 底部悬浮字幕
@@ -65,19 +65,15 @@ struct ContentView: View {
                 }
             }
             
-            // 3. 底部控制栏
+            // 底部控制栏
             HStack {
                 Spacer()
                 Button(action: {
-                    if isTranslating {
-                        stopTranslation()
-                    } else {
-                        startTranslation()
-                    }
+                    if isTranslating { stopTranslation() } else { startTranslation() }
                 }) {
                     HStack {
-                        Image(systemName: isTranslating ? "stop.circle.fill" : "play.circle.fill")
-                        Text(isTranslating ? "停止字幕" : "开启内部音频翻译")
+                        Image(systemName: isTranslating ? "stop.circle.fill" : "mic.circle.fill")
+                        Text(isTranslating ? "停止听译" : "开启麦克风听译")
                     }
                     .font(.headline)
                     .padding(.horizontal, 30)
@@ -94,39 +90,45 @@ struct ContentView: View {
     }
     
     func loadURL() {
-        var formattedUrl = urlString
+        var formattedUrl = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        // 针对 IPv6 的特殊处理，千万别乱加 https，不然会报错
         if !formattedUrl.hasPrefix("http://") && !formattedUrl.hasPrefix("https://") {
-            formattedUrl = "https://" + formattedUrl
+            formattedUrl = "http://" + formattedUrl
         }
+        
         if let url = URL(string: formattedUrl) {
             currentURL = url
             isUrlFocused = false
+        } else {
+            subtitleText = "网址格式错误，请检查 IPv6 格式"
         }
     }
     
+    // MARK: - 麦克风听译逻辑（回到最稳的方案）
     func startTranslation() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
                 if authStatus == .authorized {
                     do {
-                        try self.setupAudioSession()
+                        try self.setupMicrophone()
                         self.setupSpeechRecognition()
                         isTranslating = true
-                        subtitleText = "正在监听网页音频..."
+                        subtitleText = "正在听麦克风声音（请外放视频）..."
                     } catch {
-                        subtitleText = "启动失败: \(error.localizedDescription)"
+                        subtitleText = "启动失败，请检查权限"
                     }
                 } else {
-                    subtitleText = "请去设置允许语音识别权限"
+                    subtitleText = "请去设置允许麦克风和语音识别权限"
                 }
             }
         }
     }
     
-    func setupAudioSession() throws {
+    func setupMicrophone() throws {
         let audioSession = AVAudioSession.sharedInstance()
-        // 允许后台和混音，防止网页视频静音
-        try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+        // 要求使用麦克风，并且允许混音（这样视频外放的声音也能被录进去）
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
         try audioSession.setActive(true)
     }
     
@@ -136,6 +138,9 @@ struct ContentView: View {
         guard let request = recognitionRequest else { return }
         request.shouldReportPartialResults = true
         
+        // 开启麦克风硬件底层收音
+        let inputNode = AVAudioEngine().inputNode
+        
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
@@ -144,17 +149,27 @@ struct ContentView: View {
                 }
             }
         }
+        
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
+            self.recognitionRequest?.append(buffer)
+        }
+        
+        let audioEngine = AVAudioEngine()
+        audioEngine.attach(inputNode)
+        audioEngine.prepare()
+        try? audioEngine.start()
     }
     
     func stopTranslation() {
         recognitionRequest?.endAudio()
         recognitionTask?.cancel()
         isTranslating = false
-        subtitleText = "字幕已停止"
+        subtitleText = "听译已停止"
     }
 }
 
-// 带有 JS 注入抓取音频的 WebView
+// 纯净版 WebView（去掉了那些会拦截网页的 JS）
 struct AudioCaptureWebView: UIViewRepresentable {
     let url: URL
     let isListening: Bool
@@ -165,77 +180,14 @@ struct AudioCaptureWebView: UIViewRepresentable {
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         
-        let contentController = WKUserContentController()
-        contentController.add(context.coordinator, name: "audioHandler")
-        config.userContentController = contentController
-        
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         return webView
     }
     
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        // 只有当网址不同的时候才重新加载，避免打断视频
         if uiView.url?.absoluteString != url.absoluteString {
             uiView.load(URLRequest(url: url))
-        }
-        
-        if isListening {
-            let js = """
-            (function() {
-                var videos = document.getElementsByTagName('video');
-                if (videos.length > 0 && !window.isCapturing) {
-                    window.isCapturing = true;
-                    var video = videos[0];
-                    
-                    // ⚠️ 如果想边看边听声音，这里改成 false。但是苹果系统不允许同时输出到扬声器和 JS 处理，必须静音。
-                    video.muted = true; 
-                    
-                    var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-                    var source = audioCtx.createMediaElementSource(video);
-                    var processor = audioCtx.createScriptProcessor(4096, 1, 1);
-                    processor.onaudioprocess = function(e) {
-                        var inputData = e.inputBuffer.getChannelData(0);
-                        window.webkit.messageHandlers.audioHandler.postMessage(Array.from(inputData));
-                    };
-                    source.connect(processor);
-                    processor.connect(audioCtx.destination);
-                }
-            })();
-            """
-            uiView.evaluateJavaScript(js)
-        }
-    }
-    
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onAudioBuffer: onAudioBuffer)
-    }
-    
-    class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
-        let onAudioBuffer: (AVAudioPCMBuffer) -> Void
-        
-        init(onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
-            self.onAudioBuffer = onAudioBuffer
-        }
-        
-        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-            guard let array = message.body as? [Float] else { return }
-            
-            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
-            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(array.count)) else { return }
-            buffer.frameLength = AVAudioFrameCount(array.count)
-            
-            for i in 0..<array.count {
-                buffer.floatChannelData?[0][i] = array[i]
-            }
-            
-            self.onAudioBuffer(buffer)
-        }
-        
-        // 页面加载完成后，如果正在听，自动注入一次
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // 可以在这里处理页面加载完的逻辑
         }
     }
 }
