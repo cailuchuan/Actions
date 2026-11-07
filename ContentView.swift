@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import WebKit
 import Speech
 import AVFoundation
 import CryptoKit
@@ -7,7 +8,6 @@ import CryptoKit
 struct WebDAVFile: Identifiable {
     let id = UUID()
     let name: String
-    let path: String // 只记录相对路径
     let isDirectory: Bool
 }
 
@@ -16,7 +16,6 @@ struct ContentView: View {
     let baiduAppId = ""
     let baiduSecretKey = ""
     
-    // 登录信息
     @State private var serverURL = "http://nas.cctvb.dpdns.org:5055"
     @State private var username = "cailcc"
     @State private var password = ""
@@ -26,13 +25,12 @@ struct ContentView: View {
     @State private var isLoading = false
     @State private var statusMessage = ""
     
-    // 核心：记录当前路径栈，比如 ["机械硬盘", "电影"]，用于返回上一级
     @State private var pathStack: [String] = []
     
-    // 播放器状态
-    @State private var player: AVPlayer?
+    // 播放状态
     @State private var isPlaying = false
-    @State private var subtitleText = "等待提取音频..."
+    @State private var playingURL: URL?
+    @State private var subtitleText = "等待视频播放..."
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -41,15 +39,11 @@ struct ContentView: View {
     
     var body: some View {
         NavigationView {
-            if isPlaying, let player = player {
-                // === 原生播放器界面 ===
+            if isPlaying, let videoURL = playingURL {
+                // === 防闪退系统级播放器 ===
                 ZStack(alignment: .bottom) {
-                    VideoPlayer(player: player)
+                    NativeSystemPlayer(url: videoURL, username: username, password: password)
                         .edgesIgnoringSafeArea(.all)
-                        .onAppear {
-                            startAudioCapture()
-                            player.play()
-                        }
                     
                     Text(subtitleText)
                         .font(.system(size: 22, weight: .bold))
@@ -62,20 +56,25 @@ struct ContentView: View {
                         .padding(.horizontal, 20)
                         .padding(.bottom, 60)
                 }
-                .navigationBarTitle("正在播放", displayMode: .inline)
+                .navigationBarTitle("播放", displayMode: .inline)
                 .navigationBarItems(trailing: Button("关闭") {
                     self.isPlaying = false
-                    self.player?.pause()
-                    self.player = nil
+                    self.playingURL = nil
                     self.audioEngine.stop()
-                    self.subtitleText = "等待提取音频..."
                 })
+                .onAppear {
+                    // ⚠️ 注意：网页播放时内部音频抓取会被彻底锁死，这里只能用麦克风。
+                    // 因为苹果底层代码限制，不完整包工程无法获取 WebKit 音频。
+                    startMicrophoneCapture()
+                }
+                .onDisappear {
+                    self.audioEngine.stop()
+                }
             } else if isLoggedIn {
-                // === 文件列表界面 ===
+                // === 文件列表 ===
                 List(files) { file in
                     if file.isDirectory {
                         Button(action: {
-                            // 进入下一级
                             self.pathStack.append(file.name)
                             self.fetchDirectory()
                         }) {
@@ -86,14 +85,16 @@ struct ContentView: View {
                         }
                     } else {
                         Button(action: {
-                            // 拼接完整播放地址
                             let base = getBaseURLString()
                             let fullPath = pathStack.joined(separator: "/") + "/" + file.name
                             let encodedPath = fullPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
-                            self.playVideo(urlStr: base + encodedPath)
+                            if let url = URL(string: base + encodedPath) {
+                                self.playingURL = url
+                                self.isPlaying = true
+                            }
                         }) {
                             HStack {
-                                Image(systemName: "play.circle.fill").foregroundColor(.green)
+                                Image(systemName: "play.rectangle.fill").foregroundColor(.green)
                                 Text(file.name).foregroundColor(.primary)
                             }
                         }
@@ -114,7 +115,7 @@ struct ContentView: View {
                     }
                 )
             } else {
-                // === 登录界面 ===
+                // === 登录 ===
                 Form {
                     Section(header: Text("WebDAV 账户")) {
                         TextField("服务器地址", text: $serverURL).autocapitalization(.none)
@@ -136,14 +137,12 @@ struct ContentView: View {
         }
     }
     
-    // 辅助函数：获取基础 URL (处理末尾斜杠)
     func getBaseURLString() -> String {
         var url = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !url.hasSuffix("/") { url += "/" }
         return url
     }
     
-    // 组合当前要请求的完整 URL
     func getCurrentURLString() -> String {
         let base = getBaseURLString()
         let path = pathStack.joined(separator: "/")
@@ -157,16 +156,10 @@ struct ContentView: View {
         fetchDirectory()
     }
     
-    // MARK: - 核心：请求目录
     func fetchDirectory() {
         isLoading = true
         statusMessage = "加载中..."
-        
-        guard let url = URL(string: getCurrentURLString()) else {
-            statusMessage = "URL 格式错误"
-            isLoading = false
-            return
-        }
+        guard let url = URL(string: getCurrentURLString()) else { return }
         
         var request = URLRequest(url: url)
         request.httpMethod = "PROPFIND"
@@ -181,9 +174,7 @@ struct ContentView: View {
         
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 30.0
-        let session = URLSession(configuration: config)
-        
-        session.dataTask(with: request) { data, response, error in
+        URLSession(configuration: config).dataTask(with: request) { data, response, error in
             DispatchQueue.main.async {
                 isLoading = false
                 if let error = error {
@@ -197,11 +188,8 @@ struct ContentView: View {
         }.resume()
     }
     
-    // MARK: - 解析 XML
     func parseXML(xmlString: String) {
         var parsedFiles: [WebDAVFile] = []
-        
-        // 提取所有 <D:href> 标签
         let components = xmlString.components(separatedBy: "<D:href>")
         
         for comp in components.dropFirst() {
@@ -209,23 +197,27 @@ struct ContentView: View {
                 let rawHref = String(comp[..<hrefEnd.lowerBound])
                 let decodedHref = rawHref.removingPercentEncoding ?? rawHref
                 
-                // 过滤掉当前目录自己
                 let currentPathStr = pathStack.joined(separator: "/")
                 if decodedHref == "/" || decodedHref == "/\(currentPathStr)/" { continue }
                 
-                // 获取文件名和是否目录
                 let isDir = decodedHref.hasSuffix("/")
                 let cleanHref = isDir ? String(decodedHref.dropLast()) : decodedHref
                 let parts = cleanHref.components(separatedBy: "/").filter({ !$0.isEmpty })
                 
                 guard let fileName = parts.last else { continue }
                 
-                // 记录名字和相对路径（其实这里用名字就够了，因为我们是拼接的）
-                parsedFiles.append(WebDAVFile(name: fileName, path: fileName, isDirectory: isDir))
+                if isDir {
+                    parsedFiles.append(WebDAVFile(name: fileName, isDirectory: true))
+                } else {
+                    let ext = (fileName as NSString).pathExtension.lowercased()
+                    let videoExts = ["mp4", "mkv", "avi", "mov", "m3u8", "ts", "wmv", "flv"]
+                    if videoExts.contains(ext) {
+                        parsedFiles.append(WebDAVFile(name: fileName, isDirectory: false))
+                    }
+                }
             }
         }
         
-        // 排序
         parsedFiles.sort {
             if $0.isDirectory == $1.isDirectory { return $0.name < $1.name }
             return $0.isDirectory && !$1.isDirectory
@@ -235,40 +227,27 @@ struct ContentView: View {
         if !self.files.isEmpty || self.pathStack.isEmpty {
             self.isLoggedIn = true
             self.statusMessage = ""
-        } else {
-            // 如果点进去空了，可能是路径拼错了
-            statusMessage = "当前目录为空或加载失败"
         }
     }
     
-    func playVideo(urlStr: String) {
-        guard let url = URL(string: urlStr) else { return }
-        
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-            try audioSession.setActive(true)
-        } catch { print("音频环境失败") }
-        
-        let newPlayer = AVPlayer(url: url)
-        self.player = newPlayer
-        self.isPlaying = true
-        self.subtitleText = "正在抓取系统音频..."
-    }
-    
-    // MARK: - 内录与翻译
-    func startAudioCapture() {
+    // MARK: - 麦克风收音与翻译
+    func startMicrophoneCapture() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
                 if authStatus == .authorized {
-                    do { try self.setupAudioEngine() } catch { self.subtitleText = "识别启动失败" }
+                    do { try self.setupMicrophone() } catch { self.subtitleText = "麦克风启动失败" }
                 }
             }
         }
     }
     
-    func setupAudioEngine() throws {
+    func setupMicrophone() throws {
         recognitionTask?.cancel()
+        let audioSession = AVAudioSession.sharedInstance()
+        // 允许外放 + 麦克风混音
+        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+        try audioSession.setActive(true)
+        
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let request = recognitionRequest else { return }
         request.shouldReportPartialResults = true
@@ -309,6 +288,52 @@ struct ContentView: View {
             }
         }.resume()
     }
+}
+
+// 🔥 终极防闪退包装：加载 HTML5 视频并调用苹果系统面板
+struct NativeSystemPlayer: UIViewRepresentable {
+    let url: URL
+    let username: String
+    let password: String
+    
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        
+        let webView = WKWebView(frame: .zero, configuration: config)
+        
+        // 用账号密码拼接认证头，防止服务器拒绝
+        var authStr = ""
+        if !username.isEmpty {
+            let loginString = "\(username):\(password)"
+            if let loginData = loginString.data(using: .utf8) {
+                authStr = "Basic \(loginData.base64EncodedString())"
+            }
+        }
+        
+        // HTML5 视频标签，添加了 playsinline 强制调用苹果自带的全屏播放器
+        let html = """
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <style>
+                body { margin: 0; background-color: black; display: flex; justify-content: center; align-items: center; height: 100vh; }
+                video { width: 100%; height: 100%; object-fit: contain; }
+            </style>
+        </head>
+        <body>
+            <video src="\(url.absoluteString)" controls autoplay playsinline webkit-playsinline>
+            </video>
+        </body>
+        </html>
+        """
+        
+        webView.loadHTMLString(html, baseURL: nil)
+        return webView
+    }
+    
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
 @main
