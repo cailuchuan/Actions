@@ -14,41 +14,42 @@ struct ContentView: View {
     @FocusState private var isUrlFocused: Bool
     
     // ⚠️ 填入你的百度翻译 API
-    let baiduAppId = "你的APP_ID"
-    let baiduSecretKey = "你的密钥"
+    let baiduAppId = ""
+    let baiduSecretKey = ""
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     @State private var recognitionTask: SFSpeechRecognitionTask?
     
+    // ⚠️ 必须用 @State 强引用，否则闪退！
+    @State private var audioEngine = AVAudioEngine()
+    
+    // 用来刷新 WebView 的标识
+    @State private var refreshID = UUID()
+    
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部地址栏
             HStack {
                 TextField("输入网址", text: $urlString)
                     .textFieldStyle(RoundedBorderTextFieldStyle())
                     .keyboardType(.URL)
                     .autocapitalization(.none)
-                    .disableAutocorrection(true)
                     .focused($isUrlFocused)
                     .onSubmit { loadURL() }
-                
-                Button("前往") { loadURL() }
-                    .padding(.leading, 5)
+                Button("前往") { loadURL() }.padding(.leading, 5)
             }
-            .padding()
-            .background(Color(UIColor.systemGray6))
+            .padding().background(Color(UIColor.systemGray6))
             
-            // 浏览器与字幕层
             ZStack(alignment: .bottom) {
                 if let url = currentURL {
-                    WebView(url: url)
-                        .edgesIgnoringSafeArea(.bottom)
-                } else {
-                    Text("请输入网址并点击前往").foregroundColor(.gray)
+                    AudioCaptureWebView(url: url, isListening: isTranslating) { audioBuffer in
+                        // 收到网页传来的音频，丢给语音识别
+                        self.recognitionRequest?.append(audioBuffer)
+                    }
+                    .id(refreshID) // 强制刷新
+                    .edgesIgnoringSafeArea(.bottom)
                 }
                 
-                // 底部悬浮字幕
                 VStack {
                     Spacer()
                     if isTranslating {
@@ -66,15 +67,14 @@ struct ContentView: View {
                 }
             }
             
-            // 底部控制栏
             HStack {
                 Spacer()
                 Button(action: {
                     if isTranslating { stopTranslation() } else { startTranslation() }
                 }) {
                     HStack {
-                        Image(systemName: isTranslating ? "stop.circle.fill" : "mic.circle.fill")
-                        Text(isTranslating ? "停止听译" : "开启麦克风听译")
+                        Image(systemName: isTranslating ? "stop.circle.fill" : "waveform.circle.fill")
+                        Text(isTranslating ? "停止抓取" : "开启内部音频抓取")
                     }
                     .font(.headline)
                     .padding(.horizontal, 30)
@@ -85,8 +85,7 @@ struct ContentView: View {
                 }
                 Spacer()
             }
-            .padding(.vertical, 10)
-            .background(Color(UIColor.systemGray6))
+            .padding(.vertical, 10).background(Color(UIColor.systemGray6))
         }
     }
     
@@ -98,6 +97,7 @@ struct ContentView: View {
         if let url = URL(string: formattedUrl) {
             currentURL = url
             isUrlFocused = false
+            refreshID = UUID() // 刷新网页
         }
     }
     
@@ -106,22 +106,14 @@ struct ContentView: View {
             DispatchQueue.main.async {
                 if authStatus == .authorized {
                     do {
-                        try self.setupMicrophone()
                         self.setupSpeechRecognition()
-                        isTranslating = true
-                        subtitleText = "正在听麦克风声音..."
-                    } catch {
-                        subtitleText = "启动失败"
+                        self.isTranslating = true
+                        self.refreshID = UUID() // 刷新 WebView 以注入 JS
+                        self.subtitleText = "正在抓取内部音频..."
                     }
                 }
             }
         }
-    }
-    
-    func setupMicrophone() throws {
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
-        try audioSession.setActive(true)
     }
     
     func setupSpeechRecognition() {
@@ -130,24 +122,24 @@ struct ContentView: View {
         guard let request = recognitionRequest else { return }
         request.shouldReportPartialResults = true
         
-        let audioEngine = AVAudioEngine()
-        let inputNode = audioEngine.inputNode
-        
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
-                // 调用百度翻译
-                self.translateWithBaidu(text: japanese)
+                if self.baiduAppId.isEmpty {
+                    DispatchQueue.main.async { self.subtitleText = japanese }
+                } else {
+                    self.translateWithBaidu(text: japanese)
+                }
             }
         }
-        
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
-            self.recognitionRequest?.append(buffer)
-        }
-        
-        audioEngine.prepare()
-        try? audioEngine.start()
+    }
+    
+    func stopTranslation() {
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        isTranslating = false
+        refreshID = UUID()
+        subtitleText = "已停止"
     }
     
     func translateWithBaidu(text: String) {
@@ -162,36 +154,115 @@ struct ContentView: View {
         let params = "q=\(text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&from=jp&to=zh&appid=\(baiduAppId)&salt=\(salt)&sign=\(sign)"
         request.httpBody = params.data(using: .utf8)
         
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        URLSession.shared.dataTask(with: request) { data, _, _ in
             guard let data = data else { return }
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let transResult = json["trans_result"] as? [[String: Any]],
                let dst = transResult.first?["dst"] as? String {
-                DispatchQueue.main.async {
-                    self.subtitleText = dst
-                }
+                DispatchQueue.main.async { self.subtitleText = dst }
             }
         }.resume()
     }
-    
-    func stopTranslation() {
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
-        isTranslating = false
-        subtitleText = "听译已停止"
-    }
 }
 
-struct WebView: UIViewRepresentable {
+// MARK: - 注入 JS 抓取音频的 WebView
+struct AudioCaptureWebView: UIViewRepresentable {
     let url: URL
+    let isListening: Bool
+    let onAudioBuffer: (AVAudioPCMBuffer) -> Void
+    
     func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        
+        let contentController = WKUserContentController()
+        contentController.add(context.coordinator, name: "audioHandler")
+        config.userContentController = contentController
+        
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
         webView.load(URLRequest(url: url))
         return webView
     }
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        if uiView.url?.absoluteString != url.absoluteString {
+            uiView.load(URLRequest(url: url))
+        }
+        
+        if isListening {
+            // 终极 JS 脚本：遍历所有可能的音视频标签，强行截获
+            let js = """
+            (function() {
+                if (window.isCapturing) return;
+                
+                function captureMedia() {
+                    var media = document.querySelectorAll('video, audio');
+                    if (media.length === 0) return false;
+                    
+                    var target = null;
+                    for (var i = 0; i < media.length; i++) {
+                        if (!media[i].paused) { target = media[i]; break; }
+                    }
+                    if (!target) target = media[0];
+                    
+                    try {
+                        window.isCapturing = true;
+                        // 必须静音原视频，否则系统不允许抓取
+                        target.muted = true; 
+                        
+                        var audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 44100});
+                        var source = audioCtx.createMediaElementSource(target);
+                        var processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                        
+                        processor.onaudioprocess = function(e) {
+                            var inputData = e.inputBuffer.getChannelData(0);
+                            window.webkit.messageHandlers.audioHandler.postMessage(Array.from(inputData));
+                        };
+                        
+                        source.connect(processor);
+                        processor.connect(audioCtx.destination);
+                        console.log("Audio capture started successfully");
+                    } catch(e) {
+                        console.log("Capture failed: " + e.message);
+                    }
+                    return true;
+                }
+                
+                if (!captureMedia()) {
+                    // 如果页面还没加载出视频，每2秒尝试一次
+                    var interval = setInterval(function() {
+                        if (captureMedia()) clearInterval(interval);
+                    }, 2000);
+                }
+            })();
+            """
+            uiView.evaluateJavaScript(js)
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onAudioBuffer: onAudioBuffer)
+    }
+    
+    class Coordinator: NSObject, WKScriptMessageHandler {
+        let onAudioBuffer: (AVAudioPCMBuffer) -> Void
+        init(onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+            self.onAudioBuffer = onAudioBuffer
+        }
+        
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let array = message.body as? [Float] else { return }
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(array.count)) else { return }
+            buffer.frameLength = AVAudioFrameCount(array.count)
+            for i in 0..<array.count {
+                buffer.floatChannelData?[0][i] = array[i]
+            }
+            self.onAudioBuffer(buffer)
+        }
+    }
 }
 
 @main
