@@ -1,185 +1,242 @@
 import SwiftUI
+import WebKit
 import Speech
 import AVFoundation
-import AVKit
-import CryptoKit
-import UIKit
-
-// 用于画中画的字幕视图
-class SubtitleViewController: UIViewController {
-    var label: UILabel!
-    
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
-        label = UILabel()
-        label.textColor = .white
-        label.font = .boldSystemFont(ofSize: 24)
-        label.textAlignment = .center
-        label.numberOfLines = 0
-        label.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(label)
-        
-        NSLayoutConstraint.activate([
-            label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            label.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            label.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10)
-        ])
-    }
-}
 
 struct ContentView: View {
-    @State private var isRecording = false
-    @State private var recognizedText = "等待日文..."
-    @State private var translatedText = "等待翻译..."
+    @State private var isTranslating = false
+    @State private var subtitleText = "等待视频播放..."
     
-    // ⚠️ 替换成你自己的百度 API
-    let baiduAppId = "你的APP_ID填这里"
-    let baiduSecretKey = "你的密钥填这里"
+    // 浏览器状态
+    @State private var urlString = "https://www.w3schools.com/html/html5_video.asp"
+    @State private var currentURL: URL? = URL(string: "https://www.w3schools.com/html/html5_video.asp")
+    @FocusState private var isUrlFocused: Bool
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     @State private var recognitionTask: SFSpeechRecognitionTask?
-    private let audioEngine = AVAudioEngine()
-    
-    // 画中画控制器和视图
-    @State private var pipController: AVPictureInPictureController?
-    @State private var pipVC: SubtitleViewController?
     
     var body: some View {
-        VStack(spacing: 15) {
-            Text("日文悬浮翻译").font(.title).bold()
+        VStack(spacing: 0) {
+            // 1. 顶部地址栏
+            HStack {
+                TextField("输入网址", text: $urlString)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
+                    .keyboardType(.URL)
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                    .focused($isUrlFocused)
+                    .onSubmit {
+                        loadURL()
+                    }
+                
+                Button("前往") {
+                    loadURL()
+                }
+                .padding(.leading, 5)
+            }
+            .padding()
+            .background(Color(UIColor.systemGray6))
             
-            ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("日文：").font(.headline)
-                    Text(recognizedText).padding().frame(maxWidth: .infinity, alignment: .leading).background(Color.gray.opacity(0.2)).cornerRadius(8)
-                    
-                    Text("中文：").font(.headline).foregroundColor(.blue)
-                    Text(translatedText).padding().frame(maxWidth: .infinity, alignment: .leading).background(Color.blue.opacity(0.1)).cornerRadius(8)
+            // 2. 浏览器与字幕层
+            ZStack(alignment: .bottom) {
+                if let url = currentURL {
+                    AudioCaptureWebView(url: url, isListening: isTranslating) { audioBuffer in
+                        self.recognitionRequest?.append(audioBuffer)
+                    }
+                    .edgesIgnoringSafeArea(.bottom)
+                }
+                
+                // 底部悬浮字幕
+                VStack {
+                    Spacer()
+                    if isTranslating {
+                        Text(subtitleText)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 10)
+                            .background(Color.black.opacity(0.8))
+                            .cornerRadius(8)
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 80)
+                    }
                 }
             }
             
-            Button(action: {
-                if isRecording { stopRecording() } else { startRecording() }
-            }) {
-                Text(isRecording ? "停止并关闭悬浮窗" : "开启听译并悬浮")
-                    .font(.title2).padding().frame(maxWidth: .infinity)
-                    .background(isRecording ? Color.red : Color.green)
-                    .foregroundColor(.white).cornerRadius(10)
+            // 3. 底部控制栏
+            HStack {
+                Spacer()
+                Button(action: {
+                    if isTranslating {
+                        stopTranslation()
+                    } else {
+                        startTranslation()
+                    }
+                }) {
+                    HStack {
+                        Image(systemName: isTranslating ? "stop.circle.fill" : "play.circle.fill")
+                        Text(isTranslating ? "停止字幕" : "开启内部音频翻译")
+                    }
+                    .font(.headline)
+                    .padding(.horizontal, 30)
+                    .padding(.vertical, 12)
+                    .background(isTranslating ? Color.red.opacity(0.9) : Color.blue.opacity(0.9))
+                    .foregroundColor(.white)
+                    .cornerRadius(25)
+                }
+                Spacer()
             }
-        }.padding()
+            .padding(.vertical, 10)
+            .background(Color(UIColor.systemGray6))
+        }
     }
     
-    func startRecording() {
+    func loadURL() {
+        var formattedUrl = urlString
+        if !formattedUrl.hasPrefix("http://") && !formattedUrl.hasPrefix("https://") {
+            formattedUrl = "https://" + formattedUrl
+        }
+        if let url = URL(string: formattedUrl) {
+            currentURL = url
+            isUrlFocused = false
+        }
+    }
+    
+    func startTranslation() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
                 if authStatus == .authorized {
                     do {
-                        try self.startAudioEngine()
-                        self.startPiP() // 启动画中画
-                        isRecording = true
-                    } catch { recognizedText = "启动失败" }
+                        try self.setupAudioSession()
+                        self.setupSpeechRecognition()
+                        isTranslating = true
+                        subtitleText = "正在监听网页音频..."
+                    } catch {
+                        subtitleText = "启动失败: \(error.localizedDescription)"
+                    }
+                } else {
+                    subtitleText = "请去设置允许语音识别权限"
                 }
             }
         }
     }
     
-    // MARK: - 核心：启动画中画
-    func startPiP() {
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
-            print("设备不支持画中画")
-            return
-        }
-        
-        let vc = SubtitleViewController()
-        self.pipVC = vc
-        
-        // 使用 iOS 15+ 的视频通话画中画接口
-        let pipVideoCallVC = AVPictureInPictureVideoCallViewController()
-        pipVideoCallVC.addChild(vc)
-        pipVideoCallVC.view.addSubview(vc.view)
-        vc.view.frame = pipVideoCallVC.view.bounds
-        vc.didMove(toParent: pipVideoCallVC)
-        
-        let contentSource = AVPictureInPictureController.ContentSource(
-            activeVideoCallSourceView: vc.view,
-            contentViewController: pipVideoCallVC
-        )
-        
-        pipController = AVPictureInPictureController(contentSource: contentSource)
-        pipController?.canStartPictureInPictureAutomaticallyFromInline = true
-        
-        // 延迟一点启动，等待视图加载
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            if let pip = self.pipController, pip.isPictureInPicturePossible {
-                pip.startPictureInPicture()
-            } else {
-                print("画中画启动失败")
-            }
-        }
+    func setupAudioSession() throws {
+        let audioSession = AVAudioSession.sharedInstance()
+        // 允许后台和混音，防止网页视频静音
+        try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
+        try audioSession.setActive(true)
     }
     
-    // MARK: - 音频与翻译
-    func startAudioEngine() throws {
+    func setupSpeechRecognition() {
         recognitionTask?.cancel()
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
-        try audioSession.setActive(true)
-        
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let recognitionRequest = recognitionRequest else { return }
-        recognitionRequest.shouldReportPartialResults = true
+        guard let request = recognitionRequest else { return }
+        request.shouldReportPartialResults = true
         
-        let inputNode = audioEngine.inputNode
-        recognitionTask = speechRecognizer?.recognitionTask(with: recognitionRequest) { result, error in
+        recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
-                DispatchQueue.main.async { self.recognizedText = japanese }
-                self.translateWithBaidu(text: japanese)
-            }
-        }
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
-            self.recognitionRequest?.append(buffer)
-        }
-        audioEngine.prepare()
-        try audioEngine.start()
-    }
-    
-    func stopRecording() {
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        recognitionRequest?.endAudio()
-        pipController?.stopPictureInPicture()
-        isRecording = false
-    }
-    
-    func translateWithBaidu(text: String) {
-        if text.isEmpty { return }
-        let salt = String(Int(Date().timeIntervalSince1970))
-        let signStr = baiduAppId + text + salt + baiduSecretKey
-        let sign = Insecure.MD5.hash(data: signStr.data(using: .utf8)!).map { String(format: "%02hhx", $0) }.joined()
-        
-        var request = URLRequest(url: URL(string: "https://fanyi-api.baidu.com/api/trans/vip/translate")!)
-        request.httpMethod = "POST"
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let params = "q=\(text.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? "")&from=jp&to=zh&appid=\(baiduAppId)&salt=\(salt)&sign=\(sign)"
-        request.httpBody = params.data(using: .utf8)
-        
-        URLSession.shared.dataTask(with: request) { data, response, error in
-            guard let data = data else { return }
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let transResult = json["trans_result"] as? [[String: Any]],
-               let dst = transResult.first?["dst"] as? String {
                 DispatchQueue.main.async {
-                    self.translatedText = dst
-                    // 把翻译结果实时塞进悬浮窗的 UILabel 里！
-                    self.pipVC?.label.text = dst
+                    self.subtitleText = japanese
                 }
             }
-        }.resume()
+        }
+    }
+    
+    func stopTranslation() {
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+        isTranslating = false
+        subtitleText = "字幕已停止"
+    }
+}
+
+// 带有 JS 注入抓取音频的 WebView
+struct AudioCaptureWebView: UIViewRepresentable {
+    let url: URL
+    let isListening: Bool
+    let onAudioBuffer: (AVAudioPCMBuffer) -> Void
+    
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        
+        let contentController = WKUserContentController()
+        contentController.add(context.coordinator, name: "audioHandler")
+        config.userContentController = contentController
+        
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.navigationDelegate = context.coordinator
+        webView.load(URLRequest(url: url))
+        return webView
+    }
+    
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // 只有当网址不同的时候才重新加载，避免打断视频
+        if uiView.url?.absoluteString != url.absoluteString {
+            uiView.load(URLRequest(url: url))
+        }
+        
+        if isListening {
+            let js = """
+            (function() {
+                var videos = document.getElementsByTagName('video');
+                if (videos.length > 0 && !window.isCapturing) {
+                    window.isCapturing = true;
+                    var video = videos[0];
+                    
+                    // ⚠️ 如果想边看边听声音，这里改成 false。但是苹果系统不允许同时输出到扬声器和 JS 处理，必须静音。
+                    video.muted = true; 
+                    
+                    var audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    var source = audioCtx.createMediaElementSource(video);
+                    var processor = audioCtx.createScriptProcessor(4096, 1, 1);
+                    processor.onaudioprocess = function(e) {
+                        var inputData = e.inputBuffer.getChannelData(0);
+                        window.webkit.messageHandlers.audioHandler.postMessage(Array.from(inputData));
+                    };
+                    source.connect(processor);
+                    processor.connect(audioCtx.destination);
+                }
+            })();
+            """
+            uiView.evaluateJavaScript(js)
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onAudioBuffer: onAudioBuffer)
+    }
+    
+    class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+        let onAudioBuffer: (AVAudioPCMBuffer) -> Void
+        
+        init(onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
+            self.onAudioBuffer = onAudioBuffer
+        }
+        
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let array = message.body as? [Float] else { return }
+            
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(array.count)) else { return }
+            buffer.frameLength = AVAudioFrameCount(array.count)
+            
+            for i in 0..<array.count {
+                buffer.floatChannelData?[0][i] = array[i]
+            }
+            
+            self.onAudioBuffer(buffer)
+        }
+        
+        // 页面加载完成后，如果正在听，自动注入一次
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // 可以在这里处理页面加载完的逻辑
+        }
     }
 }
 
