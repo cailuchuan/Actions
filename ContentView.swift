@@ -12,11 +12,11 @@ struct WebDAVFile: Identifiable {
 }
 
 struct ContentView: View {
-    // ⚠️ 填入你的百度翻译 API（如果不填，就只能看到日文，没有中文）
+    // ⚠️ 填入你的百度翻译 API
     let baiduAppId = ""
     let baiduSecretKey = ""
     
-    // 登录信息（为你预填了你截图里的地址）
+    // 登录信息
     @State private var serverURL = "http://nas.cctvb.dpdns.org:5055"
     @State private var username = "cailcc"
     @State private var password = ""
@@ -25,6 +25,9 @@ struct ContentView: View {
     @State private var files: [WebDAVFile] = []
     @State private var isLoading = false
     @State private var statusMessage = ""
+    
+    // 当前路径记录（用于多级目录跳转）
+    @State private var currentPathURL: URL?
     
     // 播放器状态
     @State private var player: AVPlayer?
@@ -71,28 +74,54 @@ struct ContentView: View {
             } else if isLoggedIn {
                 // === 文件列表界面 ===
                 List(files) { file in
-                    if !file.isDirectory {
+                    if file.isDirectory {
+                        // 点击文件夹，进入下一级
+                        Button(action: {
+                            if let targetURL = URL(string: file.url) {
+                                currentPathURL = targetURL
+                                fetchDirectory(url: targetURL)
+                            }
+                        }) {
+                            HStack {
+                                Image(systemName: "folder.fill").foregroundColor(.blue)
+                                Text(file.name).foregroundColor(.primary)
+                            }
+                        }
+                    } else {
+                        // 点击视频文件，进行播放
                         Button(action: {
                             playVideo(urlStr: file.url)
                         }) {
                             HStack {
-                                Image(systemName: "play.circle.fill").foregroundColor(.blue)
-                                Text(file.name)
+                                Image(systemName: "play.circle.fill").foregroundColor(.green)
+                                Text(file.name).foregroundColor(.primary)
                             }
-                        }
-                    } else {
-                        HStack {
-                            Image(systemName: "folder.fill").foregroundColor(.gray)
-                            Text(file.name).foregroundColor(.gray)
                         }
                     }
                 }
                 .navigationBarTitle("WebDAV 文件", displayMode: .inline)
-                .navigationBarItems(trailing: Button("退出") {
-                    self.isLoggedIn = false
-                    self.files = []
-                    self.statusMessage = ""
-                })
+                .navigationBarItems(
+                    leading: Button("返回上一级") {
+                        if let current = currentPathURL {
+                            // 截取上一级路径
+                            var path = current.absoluteString
+                            if path.hasSuffix("/") { path.removeLast() }
+                            if let lastSlash = path.lastIndex(of: "/") {
+                                let parentPath = String(path[..<lastSlash]) + "/"
+                                if let parentURL = URL(string: parentPath) {
+                                    currentPathURL = parentURL
+                                    fetchDirectory(url: parentURL)
+                                }
+                            }
+                        }
+                    },
+                    trailing: Button("退出") {
+                        self.isLoggedIn = false
+                        self.files = []
+                        self.statusMessage = ""
+                        self.currentPathURL = nil
+                    }
+                )
             } else {
                 // === 登录界面 ===
                 Form {
@@ -124,15 +153,13 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - 登录并获取文件
+    // MARK: - 初次登录
     func connectWebDAV() {
         isLoading = true
         statusMessage = "正在请求服务器..."
         
         var formattedURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !formattedURL.hasSuffix("/") {
-            formattedURL += "/"
-        }
+        if !formattedURL.hasSuffix("/") { formattedURL += "/" }
         
         guard let url = URL(string: formattedURL) else {
             statusMessage = "网址格式错误"
@@ -140,6 +167,13 @@ struct ContentView: View {
             return
         }
         
+        currentPathURL = url
+        fetchDirectory(url: url, isInitialLogin: true)
+    }
+    
+    // MARK: - 核心：获取目录数据
+    func fetchDirectory(url: URL, isInitialLogin: Bool = false) {
+        isLoading = true
         var request = URLRequest(url: url)
         request.httpMethod = "PROPFIND"
         request.setValue("1", forHTTPHeaderField: "Depth")
@@ -152,10 +186,9 @@ struct ContentView: View {
             }
         }
         
-        // ⚠️ 终极绕过 ATS 限制的配置
         let config = URLSessionConfiguration.ephemeral
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.tlsMinimumSupportedProtocolVersion = .TLSv10 
+        config.timeoutIntervalForRequest = 30.0
+        config.timeoutIntervalForResource = 60.0
         let session = URLSession(configuration: config)
         
         session.dataTask(with: request) { data, response, error in
@@ -172,18 +205,13 @@ struct ContentView: View {
                 }
                 
                 let xmlString = String(data: data, encoding: .utf8) ?? ""
-                if xmlString.isEmpty {
-                    statusMessage = "返回数据为空，可能是认证失败或服务器拒绝"
-                    return
-                }
-                
-                parseWebDAVXML(xmlString: xmlString, baseURL: url)
+                parseWebDAVXML(xmlString: xmlString, baseURL: url, isInitialLogin: isInitialLogin)
             }
         }.resume()
     }
     
-    // MARK: - 解析 XML
-    func parseWebDAVXML(xmlString: String, baseURL: URL) {
+    // MARK: - 解析 XML（过滤掉当前目录本身和上级目录）
+    func parseWebDAVXML(xmlString: String, baseURL: URL, isInitialLogin: Bool) {
         var parsedFiles: [WebDAVFile] = []
         let components = xmlString.components(separatedBy: "<D:href>")
         
@@ -192,26 +220,49 @@ struct ContentView: View {
                 let rawHref = String(comp[..<hrefEnd.lowerBound])
                 let decodedHref = rawHref.removingPercentEncoding ?? rawHref
                 
-                if decodedHref == "/" || decodedHref == baseURL.path { continue }
+                // 过滤掉当前目录本身的返回
+                let pathWithoutSlash = decodedHref.hasSuffix("/") ? String(decodedHref.dropLast()) : decodedHref
+                let basePathWithoutSlash = baseURL.path.hasSuffix("/") ? String(baseURL.path.dropLast()) : baseURL.path
+                if pathWithoutSlash == basePathWithoutSlash || decodedHref == "/" { continue }
                 
                 let isDir = decodedHref.hasSuffix("/")
                 let name = decodedHref.components(separatedBy: "/").filter({ !$0.isEmpty }).last ?? "未知"
                 
+                // 拼接完整 URL
                 var fullURLString = baseURL.absoluteString
                 if !fullURLString.hasSuffix("/") && !decodedHref.hasPrefix("/") {
                     fullURLString += "/"
                 }
-                fullURLString += decodedHref
+                // 如果服务器返回的是根目录绝对路径，就直接拼接域名
+                if decodedHref.hasPrefix("/") {
+                    let rootUrl = "\(baseURL.scheme ?? "http")://\(baseURL.host ?? "")\(baseURL.port != nil ? ":\(baseURL.port!)" : "")"
+                    fullURLString = rootUrl + decodedHref
+                } else {
+                    fullURLString += decodedHref
+                }
                 
-                parsedFiles.append(WebDAVFile(name: name, url: fullURLString, isDirectory: isDir))
+                // 避免重复添加
+                if !parsedFiles.contains(where: { $0.url == fullURLString }) {
+                    parsedFiles.append(WebDAVFile(name: name, url: fullURLString, isDirectory: isDir))
+                }
             }
         }
         
+        // 排序：文件夹在前，文件在后
+        parsedFiles.sort {
+            if $0.isDirectory == $1.isDirectory {
+                return $0.name < $1.name
+            }
+            return $0.isDirectory && !$1.isDirectory
+        }
+        
         if parsedFiles.isEmpty {
-            statusMessage = "登录成功，但未解析到文件（可能是 XML 格式不兼容）"
+            statusMessage = "目录为空"
         } else {
             self.files = parsedFiles
-            self.isLoggedIn = true
+            if isInitialLogin {
+                self.isLoggedIn = true
+            }
             self.statusMessage = ""
         }
     }
@@ -229,7 +280,7 @@ struct ContentView: View {
         let newPlayer = AVPlayer(url: url)
         self.player = newPlayer
         self.isPlaying = true
-        self.subtitleText = "正在抓取音频..."
+        self.subtitleText = "正在抓取系统音频..."
     }
     
     // MARK: - 内录与翻译
