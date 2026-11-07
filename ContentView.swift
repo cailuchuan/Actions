@@ -5,7 +5,7 @@ import AVFoundation
 import CryptoKit
 import UIKit
 
-// 🔥 核心：用画中画技术创建一个黑底白字的悬浮字幕条
+// 🔥 核心：画中画悬浮字幕视图
 class SubtitleViewController: UIViewController {
     var label: UILabel!
     
@@ -14,7 +14,7 @@ class SubtitleViewController: UIViewController {
         view.backgroundColor = .black
         label = UILabel()
         label.textColor = .white
-        label.font = .boldSystemFont(ofSize: 18)
+        label.font = .boldSystemFont(ofSize: 16)
         label.textAlignment = .center
         label.numberOfLines = 2
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -35,9 +35,9 @@ struct ContentView: View {
     let baiduSecretKey = ""
     
     @State private var isRecording = false
-    @State private var subtitleText = "点击下方开启悬浮字幕"
+    @State private var subtitleText = "点击下方开启悬浮实时翻译"
     
-    // 画中画控制器
+    // 画中画
     @State private var pipController: AVPictureInPictureController?
     @State private var pipVC: SubtitleViewController?
     
@@ -47,12 +47,20 @@ struct ContentView: View {
     @State private var audioEngine = AVAudioEngine()
     
     var body: some View {
-        VStack(spacing: 20) {
-            Text("全屏悬浮字幕神器").font(.largeTitle).bold()
-            Text("使用方式：\n1. 点击下方按钮开启\n2. 开启后按 Home 键退出本 App\n3. 打开你的看片 App 全屏观看\n4. 悬浮窗会实时显示中文字幕")
+        VStack(spacing: 25) {
+            Image(systemName: "waveform.and.mic")
+                .font(.system(size: 60))
+                .foregroundColor(isRecording ? .red : .blue)
+                .padding(.top, 50)
+            
+            Text("AI 实时悬浮字幕").font(.largeTitle).bold()
+            
+            Text("使用说明：\n1. 点击下方按钮开启\n2. 立刻按 Home 键退出本 App\n3. 打开视频 App 并将手机外放音量调大\n4. 悬浮窗会实时显示日译中字幕")
                 .multilineTextAlignment(.center)
                 .foregroundColor(.gray)
                 .padding()
+            
+            Spacer()
             
             Button(action: {
                 if isRecording {
@@ -61,12 +69,14 @@ struct ContentView: View {
                     startRecording()
                 }
             }) {
-                Text(isRecording ? "停止悬浮字幕" : "开启悬浮字幕")
+                Text(isRecording ? "停止并关闭悬浮窗" : "开启麦克风与悬浮窗")
                     .font(.title2).padding().frame(maxWidth: .infinity)
                     .background(isRecording ? Color.red : Color.green)
-                    .foregroundColor(.white).cornerRadius(10)
+                    .foregroundColor(.white).cornerRadius(12)
             }
-        }.padding()
+            .padding(.horizontal, 30)
+            .padding(.bottom, 50)
+        }
     }
     
     func startRecording() {
@@ -75,29 +85,25 @@ struct ContentView: View {
                 if authStatus == .authorized {
                     do {
                         try self.startAudioEngine()
-                        self.startPiP() // 启动悬浮窗
+                        self.startPiP()
                         isRecording = true
                     } catch {
-                        subtitleText = "启动失败: \(error.localizedDescription)"
+                        subtitleText = "麦克风启动失败"
                     }
                 } else {
-                    subtitleText = "请在系统设置中允许麦克风和语音识别权限"
+                    subtitleText = "请允许麦克风和语音识别权限"
                 }
             }
         }
     }
     
-    // MARK: - 启动画中画悬浮窗
+    // MARK: - 强行拉起悬浮窗（画中画）
     func startPiP() {
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
-            print("设备不支持画中画")
-            return
-        }
+        guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
         
         let vc = SubtitleViewController()
         self.pipVC = vc
         
-        // 使用 iOS 15+ 的视频通话画中画接口
         let pipVideoCallVC = AVPictureInPictureVideoCallViewController()
         pipVideoCallVC.addChild(vc)
         pipVideoCallVC.view.addSubview(vc.view)
@@ -112,12 +118,10 @@ struct ContentView: View {
         pipController = AVPictureInPictureController(contentSource: contentSource)
         pipController?.canStartPictureInPictureAutomaticallyFromInline = true
         
-        // 延迟一点启动，等待视图加载
+        // 延迟 0.5 秒启动，防止视图未加载
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             if let pip = self.pipController, pip.isPictureInPicturePossible {
                 pip.startPictureInPicture()
-            } else {
-                print("画中画启动失败")
             }
         }
     }
@@ -126,7 +130,7 @@ struct ContentView: View {
     func startAudioEngine() throws {
         recognitionTask?.cancel()
         let audioSession = AVAudioSession.sharedInstance()
-        // 允许外放，同时允许麦克风收音
+        // 允许后台播放和混音
         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
         try audioSession.setActive(true)
         
@@ -138,6 +142,7 @@ struct ContentView: View {
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
+                // 如果有 API 就翻译，没有就显示日文
                 if !self.baiduAppId.isEmpty {
                     self.translateWithBaidu(text: japanese)
                 } else {
@@ -164,7 +169,7 @@ struct ContentView: View {
         recognitionRequest?.endAudio()
         pipController?.stopPictureInPicture()
         isRecording = false
-        subtitleText = "已停止悬浮字幕"
+        subtitleText = "已停止悬浮翻译"
     }
     
     // MARK: - 百度翻译
@@ -187,7 +192,7 @@ struct ContentView: View {
                let dst = transResult.first?["dst"] as? String {
                 DispatchQueue.main.async {
                     self.subtitleText = dst
-                    // 把翻译结果实时塞进悬浮窗里
+                    // 核心：把翻译结果塞进悬浮窗
                     self.pipVC?.label.text = dst
                 }
             }
