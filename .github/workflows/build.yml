@@ -9,32 +9,21 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
-    - name: Select Xcode Version
-      run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
-
-    - name: Build and Archive
+    - name: Compile Swift to App
       run: |
-        # 这里假设你的主工程叫 RealtimeTranslator.xcodeproj，Scheme 叫 RealtimeTranslator
-        xcodebuild -project RealtimeTranslator.xcodeproj \
-          -scheme RealtimeTranslator \
-          -configuration Release \
-          -sdk iphoneos \
-          -derivedDataPath ./build \
-          CODE_SIGN_IDENTITY="" \
-          CODE_SIGNING_REQUIRED=NO \
-          CODE_SIGNING_ALLOWED=NO
+        mkdir -p Payload/Translator.app
+        cp Info.plist Payload/Translator.app/
+        xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -parse-as-library ContentView.swift -o Payload/Translator.app/Translator
+        echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>CFBundleExecutable</key><string>Translator</string><key>CFBundleIdentifier</key><string>com.test.translator</string><key>CFBundleName</key><string>Translator</string><key>CFBundleVersion</key><string>1.0</string></dict></plist>" > Payload/Translator.app/Info.plist
 
     - name: Package to IPA
       run: |
-        mkdir Payload
-        cp -r ./build/Build/Products/Release-iphoneos/RealtimeTranslator.app Payload/
-        zip -r RealtimeTranslator.ipa Payload
+        zip -r Translator.ipa Payload
 
-    - name: Upload IPA Artifact
+    - name: Upload
       uses: actions/upload-artifact@v4
       with:
         name: TrollStore-IPA
-        path: RealtimeTranslator.ipa
+        path: Translator.ipa
