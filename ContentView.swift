@@ -5,7 +5,6 @@ import AVFoundation
 import CryptoKit
 import UIKit
 
-// 🔥 核心：画中画悬浮字幕视图
 class SubtitleViewController: UIViewController {
     var label: UILabel!
     
@@ -37,7 +36,6 @@ struct ContentView: View {
     @State private var isRecording = false
     @State private var subtitleText = "点击下方开启悬浮实时翻译"
     
-    // 画中画
     @State private var pipController: AVPictureInPictureController?
     @State private var pipVC: SubtitleViewController?
     
@@ -97,7 +95,6 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - 强行拉起悬浮窗（画中画）
     func startPiP() {
         guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
         
@@ -118,7 +115,6 @@ struct ContentView: View {
         pipController = AVPictureInPictureController(contentSource: contentSource)
         pipController?.canStartPictureInPictureAutomaticallyFromInline = true
         
-        // 延迟 0.5 秒启动，防止视图未加载
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             if let pip = self.pipController, pip.isPictureInPicturePossible {
                 pip.startPictureInPicture()
@@ -126,11 +122,9 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - 麦克风收音
     func startAudioEngine() throws {
         recognitionTask?.cancel()
         let audioSession = AVAudioSession.sharedInstance()
-        // 允许后台播放和混音
         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
         try audioSession.setActive(true)
         
@@ -142,7 +136,6 @@ struct ContentView: View {
         recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
             if let result = result {
                 let japanese = result.bestTranscription.formattedString
-                // 如果有 API 就翻译，没有就显示日文
                 if !self.baiduAppId.isEmpty {
                     self.translateWithBaidu(text: japanese)
                 } else {
@@ -172,7 +165,6 @@ struct ContentView: View {
         subtitleText = "已停止悬浮翻译"
     }
     
-    // MARK: - 百度翻译
     func translateWithBaidu(text: String) {
         if text.isEmpty { return }
         let salt = String(Int(Date().timeIntervalSince1970))
@@ -192,17 +184,9 @@ struct ContentView: View {
                let dst = transResult.first?["dst"] as? String {
                 DispatchQueue.main.async {
                     self.subtitleText = dst
-                    // 核心：把翻译结果塞进悬浮窗
                     self.pipVC?.label.text = dst
                 }
             }
         }.resume()
-    }
-}
-
-@main
-struct TranslatorApp: App {
-    var body: some Scene {
-        WindowGroup { ContentView() }
     }
 }
