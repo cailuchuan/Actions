@@ -12,19 +12,19 @@ struct WebDAVFile: Identifiable {
 }
 
 struct ContentView: View {
-    // ⚠️ 填入你的百度翻译 API
+    // ⚠️ 填入你的百度翻译 API（如果不填，就只能看到日文，没有中文）
     let baiduAppId = ""
     let baiduSecretKey = ""
     
-    // 登录信息
-    @State private var serverURL = "http://[你的IPv6]:端口"
-    @State private var username = ""
+    // 登录信息（为你预填了你截图里的地址）
+    @State private var serverURL = "http://nas.cctvb.dpdns.org:5055"
+    @State private var username = "cailcc"
     @State private var password = ""
     
     @State private var isLoggedIn = false
     @State private var files: [WebDAVFile] = []
     @State private var isLoading = false
-    @State private var statusMessage = "请输入 WebDAV 信息"
+    @State private var statusMessage = ""
     
     // 播放器状态
     @State private var player: AVPlayer?
@@ -60,7 +60,7 @@ struct ContentView: View {
                         .padding(.horizontal, 20)
                         .padding(.bottom, 60)
                 }
-                .navigationBarTitle("系统播放器", displayMode: .inline)
+                .navigationBarTitle("正在播放", displayMode: .inline)
                 .navigationBarItems(trailing: Button("关闭") {
                     self.isPlaying = false
                     self.player?.pause()
@@ -91,6 +91,7 @@ struct ContentView: View {
                 .navigationBarItems(trailing: Button("退出") {
                     self.isLoggedIn = false
                     self.files = []
+                    self.statusMessage = ""
                 })
             } else {
                 // === 登录界面 ===
@@ -128,7 +129,12 @@ struct ContentView: View {
         isLoading = true
         statusMessage = "正在请求服务器..."
         
-        guard let url = URL(string: serverURL.hasSuffix("/") ? serverURL : serverURL + "/") else {
+        var formattedURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !formattedURL.hasSuffix("/") {
+            formattedURL += "/"
+        }
+        
+        guard let url = URL(string: formattedURL) else {
             statusMessage = "网址格式错误"
             isLoading = false
             return
@@ -146,11 +152,9 @@ struct ContentView: View {
             }
         }
         
-        // ⚠️ 关键：使用自定义的 URLSession 强制绕过安全拦截
-        let config = URLSessionConfiguration.default
+        // ⚠️ 终极绕过 ATS 限制的配置
+        let config = URLSessionConfiguration.ephemeral
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        config.urlCache = nil
-        // 强制允许不安全连接（针对纯代码环境）
         config.tlsMinimumSupportedProtocolVersion = .TLSv10 
         let session = URLSession(configuration: config)
         
@@ -169,7 +173,7 @@ struct ContentView: View {
                 
                 let xmlString = String(data: data, encoding: .utf8) ?? ""
                 if xmlString.isEmpty {
-                    statusMessage = "返回数据为空，可能是认证失败"
+                    statusMessage = "返回数据为空，可能是认证失败或服务器拒绝"
                     return
                 }
                 
@@ -193,7 +197,6 @@ struct ContentView: View {
                 let isDir = decodedHref.hasSuffix("/")
                 let name = decodedHref.components(separatedBy: "/").filter({ !$0.isEmpty }).last ?? "未知"
                 
-                // 拼接完整 URL
                 var fullURLString = baseURL.absoluteString
                 if !fullURLString.hasSuffix("/") && !decodedHref.hasPrefix("/") {
                     fullURLString += "/"
@@ -205,7 +208,7 @@ struct ContentView: View {
         }
         
         if parsedFiles.isEmpty {
-            statusMessage = "登录成功，但未解析到文件"
+            statusMessage = "登录成功，但未解析到文件（可能是 XML 格式不兼容）"
         } else {
             self.files = parsedFiles
             self.isLoggedIn = true
@@ -213,25 +216,23 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - 播放视频并启动系统内部音频监听
+    // MARK: - 播放视频
     func playVideo(urlStr: String) {
         guard let url = URL(string: urlStr) else { return }
         
         do {
             let audioSession = AVAudioSession.sharedInstance()
-            // 允许视频播放的同时，开启音频引擎监听
             try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
             try audioSession.setActive(true)
         } catch { print("音频环境失败") }
         
-        // 使用系统原生 AVPlayer
         let newPlayer = AVPlayer(url: url)
         self.player = newPlayer
         self.isPlaying = true
-        self.subtitleText = "正在尝试抓取系统音频..."
+        self.subtitleText = "正在抓取音频..."
     }
     
-    // MARK: - 语音识别与百度翻译
+    // MARK: - 内录与翻译
     func startAudioCapture() {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
