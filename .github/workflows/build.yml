@@ -5,11 +5,16 @@ jobs:
     runs-on: macos-15
     steps:
     - uses: actions/checkout@v4
-    - name: Compile
+    - name: Compile Swift Files
       run: |
+        # 创建 App 目录并把权限文件放进去
         mkdir -p Payload/Translator.app
         cp Info.plist Payload/Translator.app/
-        xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -parse-as-library ContentView.swift -framework AVKit -framework Speech -framework AVFoundation -framework CryptoKit -o Payload/Translator.app/Translator
+        
+        # 编译所有 Swift 文件，并引入框架
+        xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -parse-as-library ContentView.swift TranslatorApp.swift -framework AVKit -framework Speech -framework AVFoundation -framework CryptoKit -o Payload/Translator.app/Translator
+        
+        # 打包成 IPA
         zip -r Translator.ipa Payload
     - name: Upload
       uses: actions/upload-artifact@v4
