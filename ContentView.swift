@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import WebKit
 import Speech
 import AVFoundation
 import CryptoKit
@@ -8,59 +9,6 @@ struct WebDAVFile: Identifiable {
     let id = UUID()
     let name: String
     let isDirectory: Bool
-}
-
-// 🔥 苹果官方标准的 AVAssetResourceLoader 拦截器
-class AuthResourceLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionTaskDelegate {
-    let url: URL
-    let username: String
-    let password: String
-    
-    init(url: URL, user: String, pass: String) {
-        self.url = url
-        self.username = user
-        self.password = pass
-    }
-    
-    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
-        
-        var request = URLRequest(url: url)
-        
-        // 附带认证信息
-        if !username.isEmpty {
-            let loginString = "\(username):\(password)"
-            if let loginData = loginString.data(using: .utf8) {
-                request.setValue("Basic \(loginData.base64EncodedString())", forHTTPHeaderField: "Authorization")
-            }
-        }
-        
-        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
-        let task = session.dataTask(with: request) { data, response, error in
-            if let error = error {
-                loadingRequest.finishLoading(with: error)
-                return
-            }
-            if let response = response {
-                loadingRequest.response = response
-            }
-            if let data = data {
-                loadingRequest.dataRequest?.respond(with: data)
-            }
-            loadingRequest.finishLoading()
-        }
-        task.resume()
-        return true
-    }
-    
-    // 处理底层的认证质询（苹果官方推荐方式）
-    func urlSession(_ session: URLSession, task: URLSessionTask, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodHTTPBasic {
-            let credential = URLCredential(user: username, password: password, persistence: .forSession)
-            completionHandler(.useCredential, credential)
-        } else {
-            completionHandler(.performDefaultHandling, nil)
-        }
-    }
 }
 
 struct ContentView: View {
@@ -80,11 +28,8 @@ struct ContentView: View {
     
     // 播放状态
     @State private var isPlaying = false
-    @State private var player: AVPlayer?
-    @State private var subtitleText = "等待提取系统音频..."
-    
-    // 必须强引用拦截器，否则会被系统释放导致播放失败
-    @State private var resourceLoader: AuthResourceLoader?
+    @State private var playingURL: URL?
+    @State private var subtitleText = "等待视频播放..."
     
     private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
     @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -93,15 +38,12 @@ struct ContentView: View {
     
     var body: some View {
         NavigationView {
-            if isPlaying, let player = player {
-                // === 苹果官方系统播放器 ===
+            if isPlaying, let videoURL = playingURL {
+                // === 终极稳定防闪退播放器 ===
                 ZStack(alignment: .bottom) {
-                    VideoPlayer(player: player)
+                    // 网页内核播放视频，自带原生全屏按钮，绝不闪退
+                    SafeWebPlayer(url: videoURL, username: username, password: password)
                         .edgesIgnoringSafeArea(.all)
-                        .onAppear {
-                            startAudioCapture()
-                            player.play()
-                        }
                     
                     Text(subtitleText)
                         .font(.system(size: 22, weight: .bold))
@@ -114,14 +56,19 @@ struct ContentView: View {
                         .padding(.horizontal, 20)
                         .padding(.bottom, 60)
                 }
-                .navigationBarTitle("正在播放", displayMode: .inline)
+                .navigationBarTitle("播放中 (请点右下角全屏)", displayMode: .inline)
                 .navigationBarItems(trailing: Button("关闭") {
                     self.isPlaying = false
-                    self.player?.pause()
-                    self.player = nil
+                    self.playingURL = nil
                     self.audioEngine.stop()
-                    self.resourceLoader = nil
                 })
+                .onAppear {
+                    // 视频加载时，立即启动麦克风听译
+                    startMicrophoneCapture()
+                }
+                .onDisappear {
+                    self.audioEngine.stop()
+                }
             } else if isLoggedIn {
                 // === 文件列表 ===
                 List(files) { file in
@@ -141,7 +88,8 @@ struct ContentView: View {
                             let fullPath = pathStack.joined(separator: "/") + "/" + file.name
                             let encodedPath = fullPath.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""
                             if let url = URL(string: base + encodedPath) {
-                                playNativeVideo(url: url)
+                                self.playingURL = url
+                                self.isPlaying = true
                             }
                         }) {
                             HStack {
@@ -281,39 +229,17 @@ struct ContentView: View {
         }
     }
     
-    // MARK: - 采用苹果官方标准的资源加载拦截器
-    func playNativeVideo(url: URL) {
-        do {
-            let audioSession = AVAudioSession.sharedInstance()
-            // 开启后台播放和允许混音
-            try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-            try audioSession.setActive(true)
-        } catch { print("音频环境失败") }
-        
-        // 初始化官方拦截器
-        let loader = AuthResourceLoader(url: url, user: username, pass: password)
-        self.resourceLoader = loader
-        
-        // 使用非标准协议欺骗播放器，让它走拦截器（苹果官方 Sample Code 做法）
-        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
-        components?.scheme = "custom-auth-scheme"
-        guard let fakeURL = components?.url else { return }
-        
-        let asset = AVURLAsset(url: fakeURL)
-        asset.resourceLoader.setDelegate(loader, queue: DispatchQueue.global())
-        
-        let item = AVPlayerItem(asset: asset)
-        self.player = AVPlayer(playerItem: item)
-        self.isPlaying = true
-        self.subtitleText = "正在抓取系统音频..."
-    }
-    
-    // MARK: - 官方标准的系统内部音频提取逻辑
-    func startAudioCapture() {
+    // MARK: - 麦克风收音与百度翻译
+    func startMicrophoneCapture() {
         SFSpeechRecognizer.requestAuthorization { status in
             if status == .authorized {
                 DispatchQueue.main.async {
                     do {
+                        let audioSession = AVAudioSession.sharedInstance()
+                        // 允许外放的同时，使用麦克风收音
+                        try audioSession.setCategory(.playAndRecord, mode: .default, options: [.mixWithOthers, .defaultToSpeaker])
+                        try audioSession.setActive(true)
+                        
                         let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
                         let request = SFSpeechAudioBufferRecognitionRequest()
                         self.recognitionRequest = request
@@ -366,4 +292,50 @@ struct ContentView: View {
             }
         }.resume()
     }
+}
+
+// 🔥 绝对防闪退：使用网页内核播放，自带原生全屏
+struct SafeWebPlayer: UIViewRepresentable {
+    let url: URL
+    let username: String
+    let password: String
+    
+    func makeUIView(context: Context) -> WKWebView {
+        let config = WKWebViewConfiguration()
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = []
+        
+        let webView = WKWebView(frame: .zero, configuration: config)
+        
+        // 直接把 Base64 密码塞进请求头
+        var authHeader = ""
+        if !username.isEmpty {
+            let loginString = "\(username):\(password)"
+            if let loginData = loginString.data(using: .utf8) {
+                authHeader = loginData.base64EncodedString()
+            }
+        }
+        
+        // 构造 HTML5 视频，强制调用系统级全屏
+        let html = """
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <style>
+                body { margin: 0; background-color: black; display: flex; justify-content: center; align-items: center; height: 100vh; }
+                video { width: 100%; height: 100%; object-fit: contain; }
+            </style>
+        </head>
+        <body>
+            <video src="\(url.absoluteString)" controls autoplay playsinline webkit-playsinline>
+            </video>
+        </body>
+        </html>
+        """
+        
+        webView.loadHTMLString(html, baseURL: nil)
+        return webView
+    }
+    
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
