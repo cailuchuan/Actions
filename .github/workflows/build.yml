@@ -5,11 +5,12 @@ jobs:
     runs-on: macos-15
     steps:
     - uses: actions/checkout@v4
-    - name: Compile with Background Audio
+    - name: Compile
       run: |
         mkdir -p Payload/Translator.app
         cp Info.plist Payload/Translator.app/
-        xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -parse-as-library ContentView.swift -o Payload/Translator.app/Translator
+        # 引入了 UIKit 框架
+        xcrun -sdk iphoneos swiftc -target arm64-apple-ios16.0 -parse-as-library ContentView.swift -framework AVKit -framework Speech -framework AVFoundation -framework CryptoKit -framework UIKit -o Payload/Translator.app/Translator
         zip -r Translator.ipa Payload
     - name: Upload
       uses: actions/upload-artifact@v4
