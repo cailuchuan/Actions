@@ -4,28 +4,69 @@ import Speech
 import AVFoundation
 import CryptoKit
 
+// ⚠️ 把 AVAudioEngine 放在外面作为全局单例，彻底解决纯脚本编译的闪退和报错问题
+class AudioManager {
+    static let shared = AudioManager()
+    let engine = AVAudioEngine()
+    
+    func startRecording() {
+        let audioSession = AVAudioSession.sharedInstance()
+        try? audioSession.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try? audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        
+        let inputNode = engine.inputNode
+        let recordingFormat = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { (buffer, when) in
+            SpeechManager.shared.recognitionRequest?.append(buffer)
+        }
+        
+        engine.prepare()
+        try? engine.start()
+    }
+    
+    func stopRecording() {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+    }
+}
+
+class SpeechManager {
+    static let shared = SpeechManager()
+    let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
+    var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
+    var recognitionTask: SFSpeechRecognitionTask?
+    
+    func start(onResult: @escaping (String) -> Void) {
+        recognitionTask?.cancel()
+        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
+        guard let request = recognitionRequest else { return }
+        request.shouldReportPartialResults = true
+        
+        recognitionTask = recognizer?.recognitionTask(with: request) { result, error in
+            if let result = result {
+                onResult(result.bestTranscription.formattedString)
+            }
+        }
+    }
+    
+    func stop() {
+        recognitionRequest?.endAudio()
+        recognitionTask?.cancel()
+    }
+}
+
 struct ContentView: View {
     @State private var isTranslating = false
     @State private var subtitleText = "等待视频播放..."
     
-    // ⚠️ 填入你的 IPv6 地址
+    // ⚠️ 这里换成你的 Jellyfin 地址
     @State private var urlString = "http://[你的IPv6]:8096"
     @State private var currentURL: URL? = nil
     @FocusState private var isUrlFocused: Bool
     
-    // ⚠️ 填入你的百度翻译 API
+    // ⚠️ 百度 API 如果不需要可以留空，留空就只显示日文
     let baiduAppId = ""
     let baiduSecretKey = ""
-    
-    private let speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: "ja-JP"))
-    @State private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    @State private var recognitionTask: SFSpeechRecognitionTask?
-    
-    // ⚠️ 必须用 @State 强引用，否则闪退！
-    @State private var audioEngine = AVAudioEngine()
-    
-    // 用来刷新 WebView 的标识
-    @State private var refreshID = UUID()
     
     var body: some View {
         VStack(spacing: 0) {
@@ -43,10 +84,8 @@ struct ContentView: View {
             ZStack(alignment: .bottom) {
                 if let url = currentURL {
                     AudioCaptureWebView(url: url, isListening: isTranslating) { audioBuffer in
-                        // 收到网页传来的音频，丢给语音识别
-                        self.recognitionRequest?.append(audioBuffer)
+                        SpeechManager.shared.recognitionRequest?.append(audioBuffer)
                     }
-                    .id(refreshID) // 强制刷新
                     .edgesIgnoringSafeArea(.bottom)
                 }
                 
@@ -97,7 +136,6 @@ struct ContentView: View {
         if let url = URL(string: formattedUrl) {
             currentURL = url
             isUrlFocused = false
-            refreshID = UUID() // 刷新网页
         }
     }
     
@@ -105,40 +143,23 @@ struct ContentView: View {
         SFSpeechRecognizer.requestAuthorization { authStatus in
             DispatchQueue.main.async {
                 if authStatus == .authorized {
-                    do {
-                        self.setupSpeechRecognition()
-                        self.isTranslating = true
-                        self.refreshID = UUID() // 刷新 WebView 以注入 JS
-                        self.subtitleText = "正在抓取内部音频..."
+                    SpeechManager.shared.start { japanese in
+                        if !self.baiduAppId.isEmpty {
+                            self.translateWithBaidu(text: japanese)
+                        } else {
+                            DispatchQueue.main.async { self.subtitleText = japanese }
+                        }
                     }
-                }
-            }
-        }
-    }
-    
-    func setupSpeechRecognition() {
-        recognitionTask?.cancel()
-        recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-        guard let request = recognitionRequest else { return }
-        request.shouldReportPartialResults = true
-        
-        recognitionTask = speechRecognizer?.recognitionTask(with: request) { result, error in
-            if let result = result {
-                let japanese = result.bestTranscription.formattedString
-                if self.baiduAppId.isEmpty {
-                    DispatchQueue.main.async { self.subtitleText = japanese }
-                } else {
-                    self.translateWithBaidu(text: japanese)
+                    self.isTranslating = true
+                    self.subtitleText = "正在抓取网页音频..."
                 }
             }
         }
     }
     
     func stopTranslation() {
-        recognitionRequest?.endAudio()
-        recognitionTask?.cancel()
+        SpeechManager.shared.stop()
         isTranslating = false
-        refreshID = UUID()
         subtitleText = "已停止"
     }
     
@@ -165,7 +186,7 @@ struct ContentView: View {
     }
 }
 
-// MARK: - 注入 JS 抓取音频的 WebView
+// MARK: - 已修复报错的 WebView 组件
 struct AudioCaptureWebView: UIViewRepresentable {
     let url: URL
     let isListening: Bool
@@ -181,7 +202,8 @@ struct AudioCaptureWebView: UIViewRepresentable {
         config.userContentController = contentController
         
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.navigationDelegate = context.coordinator
+        // 修复报错点：将 Coordinator 设置为 navigationDelegate
+        webView.navigationDelegate = context.coordinator 
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -192,49 +214,34 @@ struct AudioCaptureWebView: UIViewRepresentable {
         }
         
         if isListening {
-            // 终极 JS 脚本：遍历所有可能的音视频标签，强行截获
             let js = """
             (function() {
                 if (window.isCapturing) return;
-                
                 function captureMedia() {
                     var media = document.querySelectorAll('video, audio');
                     if (media.length === 0) return false;
-                    
                     var target = null;
                     for (var i = 0; i < media.length; i++) {
                         if (!media[i].paused) { target = media[i]; break; }
                     }
                     if (!target) target = media[0];
-                    
                     try {
                         window.isCapturing = true;
-                        // 必须静音原视频，否则系统不允许抓取
                         target.muted = true; 
-                        
                         var audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 44100});
                         var source = audioCtx.createMediaElementSource(target);
                         var processor = audioCtx.createScriptProcessor(4096, 1, 1);
-                        
                         processor.onaudioprocess = function(e) {
                             var inputData = e.inputBuffer.getChannelData(0);
                             window.webkit.messageHandlers.audioHandler.postMessage(Array.from(inputData));
                         };
-                        
                         source.connect(processor);
                         processor.connect(audioCtx.destination);
-                        console.log("Audio capture started successfully");
-                    } catch(e) {
-                        console.log("Capture failed: " + e.message);
-                    }
+                    } catch(e) {}
                     return true;
                 }
-                
                 if (!captureMedia()) {
-                    // 如果页面还没加载出视频，每2秒尝试一次
-                    var interval = setInterval(function() {
-                        if (captureMedia()) clearInterval(interval);
-                    }, 2000);
+                    var interval = setInterval(function() { if (captureMedia()) clearInterval(interval); }, 2000);
                 }
             })();
             """
@@ -246,7 +253,8 @@ struct AudioCaptureWebView: UIViewRepresentable {
         Coordinator(onAudioBuffer: onAudioBuffer)
     }
     
-    class Coordinator: NSObject, WKScriptMessageHandler {
+    // 修复报错点：让 Coordinator 遵守 WKNavigationDelegate 协议
+    class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         let onAudioBuffer: (AVAudioPCMBuffer) -> Void
         init(onAudioBuffer: @escaping (AVAudioPCMBuffer) -> Void) {
             self.onAudioBuffer = onAudioBuffer
